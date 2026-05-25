@@ -13,57 +13,60 @@ from src.utils import from_flattened_numpy,  to_flattened_numpy
 
 #############################
 class DippoleGroundTrurthEFMODESolver:
-    
-    def __init__(self, config) -> None:
+
+    def __init__(self, config, m: float = 0.0) -> None:
         self._config = config # private attribute
-        
+        self.m = m  # Yukawa screening mass; 0.0 → standard Poisson field
+
     @property
     def config(self):
         return self._config
-    
+
     @config.setter
     def config(self,config) -> None:
         print("You modify configuration for running code")
         self._config = config
-    
-    def __call__(self, efm ,
-                       perturbed_samples_vec: torch.Tensor ,
+
+    def _field(self, efm, x: torch.Tensor,
+               p_samples: torch.Tensor, q_samples: torch.Tensor) -> torch.Tensor:
+        """Route to Poisson or Yukawa field depending on self.m."""
+        if self.m == 0.0:
+            return efm.GroundTruth(perturbed_samples_vec=x,
+                                   p_samples=p_samples, q_samples=q_samples)
+        return efm.GroundTruthYukawa(x, p_samples, q_samples, m=self.m)
+
+    def __call__(self, efm,
+                       perturbed_samples_vec: torch.Tensor,
                        p_samples: torch.Tensor,
-                       q_samples: torch.Tensor) -> tp.Sequence[torch.Tensor]: ## ???
-        
-        trajectory = [perturbed_samples_vec.clone().detach().cpu()] 
+                       q_samples: torch.Tensor) -> tp.Sequence[torch.Tensor]:
+
+        trajectory = [perturbed_samples_vec.clone().detach().cpu()]
         #### uniform motion along axis z ####
-        for step in tqdm(range(math.ceil(self._config.L//self._config.ode.step))):  
-            
-            field =  efm.GroundTruth(perturbed_samples_vec=perturbed_samples_vec,
-                                     p_samples=p_samples,
-                                     q_samples=q_samples)
-            
+        for step in tqdm(range(math.ceil(self._config.L//self._config.ode.step))):
+
+            field = self._field(efm, perturbed_samples_vec, p_samples, q_samples)
+
             perturbed_samples_vec = perturbed_samples_vec +\
-                                    (self._config.ode.step/field[:,0].view(-1,1) + self._config.ode.gamma)*field 
+                                    (self._config.ode.step/field[:,0].view(-1,1) + self._config.ode.gamma)*field
             trajectory.append(perturbed_samples_vec.clone().detach().cpu())
         #### uniform motion along axis z ####
-        
-         
+
+
         #### movement behind the second plate ####
-        field = efm.GroundTruth(perturbed_samples_vec=perturbed_samples_vec,
-                                     p_samples=p_samples,
-                                     q_samples=q_samples)
+        field = self._field(efm, perturbed_samples_vec, p_samples, q_samples)
         mask_start = field[:,0] > 0 # E_z > 0
-        mask = mask_start 
-        
+        mask = mask_start
+
         #while  torch.nonzero(mask).__len__() != 0:
         for _ in tqdm(range(self._config.ode.behind_num_steps)):
-            
-             
-            field[mask] = efm.GroundTruth(perturbed_samples_vec=perturbed_samples_vec[mask],
-                                     p_samples=p_samples,
-                                     q_samples=q_samples)
+
+
+            field[mask] = self._field(efm, perturbed_samples_vec[mask], p_samples, q_samples)
             perturbed_samples_vec[mask] = perturbed_samples_vec[mask] +\
                                           (self._config.ode.behind_step/torch.norm(field[mask],keepdim=True))*field[mask]
-            
+
             trajectory.append(perturbed_samples_vec.clone().detach().cpu())
-            mask = torch.logical_and(mask_start, (perturbed_samples_vec[:,0] >= self._config.q.x_loc + 0.05).view(-1))  
+            mask = torch.logical_and(mask_start, (perturbed_samples_vec[:,0] >= self._config.q.x_loc + 0.05).view(-1))
         #### movement behind the second plate ####
         return perturbed_samples_vec, trajectory
 #############################
@@ -360,6 +363,7 @@ class LearnedODESolver:
  
         return perturbed_samples_vec, trajectory
 #############################
+
 
 
 
