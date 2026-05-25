@@ -8,8 +8,43 @@ import math
 import typing as tp
 from tqdm import tqdm
 from IPython.display import clear_output
+from scipy.special import kv as bessel_kv, kve as bessel_kve, gammaln
+from scipy.spatial import KDTree
 
 from .ode import get_rk45_sampler_pfgm, LearnedImageODESolver
+
+
+def _kl_knn_estimate(p: np.ndarray, q: np.ndarray, k: int = 5) -> float:
+    """kNN-based estimator of KL(P ∥ Q) from samples.
+
+    Wang, Kulkarni & Verdú (2009) "Divergence Estimation for Multidimensional
+    Densities Via k-Nearest-Neighbor Distances", IEEE Trans. Inf. Theory.
+
+    Parameters
+    ----------
+    p : (n, d)  samples from P  (transported distribution T(X))
+    q : (m, d)  samples from Q  (target distribution)
+    k : number of nearest neighbours
+
+    Returns
+    -------
+    KL divergence estimate (float); non-negative in expectation.
+    """
+    n, d = p.shape
+    m    = q.shape[0]
+
+    tree_p = KDTree(p)
+    tree_q = KDTree(q)
+
+    # k-th NN distance within P (index 0 is self → take index k)
+    r_k = tree_p.query(p, k=k + 1)[0][:, k]          # [n]
+    # k-th NN distance from each P sample into Q
+    s_k = tree_q.query(p, k=k)[0][:, k - 1]          # [n]
+
+    # KL estimate: d/n * Σ log(s_k / r_k) + log(m / (n-1))
+    kl = float(d / n * np.sum(np.log((s_k + 1e-10) / (r_k + 1e-10)))
+               + np.log(m / (n - 1)))
+    return max(kl, 0.0)  # clip to 0 — estimator can go slightly negative
 
 
 
@@ -67,43 +102,92 @@ class EFM:
     
     
     
-    ######################################## 
+    ########################################
     @staticmethod
-    def plotTrajectories(*,traj: torch.Tensor,  
+    def plotTrajectories(*,traj: torch.Tensor,
                          p_samples: torch.Tensor,
-                         q_samples: torch.Tensor,**kwargs: tp.Any) -> matplotlib.figure.Figure:
-        
+                         q_samples: torch.Tensor,**kwargs: tp.Any):
+
         fig = plt.figure()
         fig.set_figheight(kwargs.get('figheight', 7))
         fig.set_figwidth( kwargs.get('figwidth', 7))
-        
+
         ax = fig.add_subplot(1,1,1,  projection='3d' )
         ax.scatter(p_samples[:,0].cpu(),p_samples[:,1].cpu(),p_samples[:,2].cpu(),
                    color='blue',edgecolor='black',s=80, label=r'$x_{+}  \sim \mathbb{P}(x_{+})$')
-        
-         
-        
+
+
+
         traj[-1][:,0] = 6.5
         for jdx in range(len(traj[-1])):
-            
+
             ax.scatter(traj[-1][jdx,0].cpu(),traj[-1][jdx,1].cpu(),traj[-1][jdx,2].cpu(),
             color='lightgreen',edgecolor='black',zorder=20,label=r'$y \sim  T(x_{+})$' if jdx==0 else None,s=80)
-            
+
             ax.scatter(q_samples[jdx,0].cpu(),q_samples[jdx,1].cpu(),q_samples[jdx,2].cpu(),
                    color='red',edgecolor='black',s=80, label=r'$x_{-}  \sim \mathbb{Q}(x_{-})$' if jdx==0 else None)
-            
+
         for idx in range(200,230):
-            ax.plot(traj[: ,idx,0].cpu(), 
+            ax.plot(traj[: ,idx,0].cpu(),
                 traj[:, idx,1].cpu(),
                 traj[:, idx,2].cpu(),
                 color='black',linewidth=0.5, zorder=3);
-        ax.set_title(kwargs.get("title", "EFM Ground Truth"))
-        ax.legend() 
+
+        # KL divergence KL(T(P) ∥ Q) estimated from samples (spatial coords only)
+        transported_np = traj[-1][:, 1:].cpu().contiguous().numpy()   # [n, d-1]
+        q_np           = q_samples[:, 1:].cpu().contiguous().numpy()  # [m, d-1]
+        kl_val = _kl_knn_estimate(transported_np, q_np,
+                                  k=kwargs.get('kl_k', 5))
+
+        base_title = kwargs.get("title", "EFM Ground Truth")
+        print(f"{base_title}  |  D_KL(T(P) || Q) = {kl_val:.4f}")
+        ax.set_title(f"{base_title}\n$D_{{KL}}(T(P) \\| Q) = {kl_val:.4f}$")
+        ax.legend()
+        return fig, kl_val
+    ########################################
+
+
+    ########################################
+    @staticmethod
+    def plotComparison2D(*, traj: torch.Tensor,
+                         q_samples: torch.Tensor,
+                         **kwargs: tp.Any) -> matplotlib.figure.Figure:
+        """
+        2D scatter: T(P) vs Q in the (x, y) plane at z = L.
+
+        Parameters
+        ----------
+        traj      : stacked trajectory tensor [steps, n, D+1]
+        q_samples : target samples            [m, D+1]
+        kl_val    : (optional kwarg) pre-computed KL value to show in title
+        """
+        transported = traj[-1][:, 1:3].cpu().contiguous().numpy()   # [n, 2]
+        q_xy        = q_samples[:, 1:3].cpu().contiguous().numpy()  # [m, 2]
+
+        fig, ax = plt.subplots(figsize=(kwargs.get('figwidth', 6),
+                                        kwargs.get('figheight', 6)))
+
+        ax.scatter(q_xy[:, 0], q_xy[:, 1],
+                   c='red', alpha=0.3, s=kwargs.get('s', 8),
+                   label=r'$x_{-} \sim Q$  (target)')
+        ax.scatter(transported[:, 0], transported[:, 1],
+                   c='limegreen', edgecolors='black', linewidths=0.3,
+                   alpha=0.8, s=kwargs.get('s', 12),
+                   label=r'$T(x_{+})$  (transported)')
+
+        base_title = kwargs.get('title', 'T(P) vs Q  [2D projection at z=L]')
+        if 'kl_val' in kwargs:
+            base_title += f"\n$D_{{KL}} = {kwargs['kl_val']:.4f}$"
+        ax.set_title(base_title)
+        ax.set_xlabel(r'$x_1$')
+        ax.set_ylabel(r'$x_2$')
+        ax.legend()
+        ax.set_aspect('equal')
+        fig.tight_layout()
         return fig
-    ######################################## 
-    
-    
-    
+    ########################################
+
+
     ######################################
     @staticmethod
     def plot(x: torch.Tensor, **kwargs: tp.Any ) -> matplotlib.figure.Figure:
@@ -202,7 +286,19 @@ class EFM:
    
     
     
-    ######################################## 
+    ########################################
+    def _compute_field(self,
+                       perturbed_samples_vec: torch.Tensor,
+                       p_samples: torch.Tensor,
+                       q_samples: torch.Tensor) -> torch.Tensor:
+        m = getattr(self._config.training, 'm', 0.0)
+        if m > 0.0:
+            return self.GroundTruthYukawa(perturbed_samples_vec, p_samples, q_samples, m=m)
+        return self.GroundTruth(perturbed_samples_vec, p_samples, q_samples)
+    ########################################
+
+
+    ########################################
     def Toytrain(self,  p_dist ,
                     q_dist ,
                     net: tp.Callable[[torch.Tensor], torch.Tensor],
@@ -218,8 +314,8 @@ class EFM:
 
             perturbed_samples_vec = self.forward_interpolation(p_samples, q_samples)
 
-            field = self.GroundTruth(perturbed_samples_vec, p_samples.clone(),
-                                                            q_samples.clone() ) 
+            field = self._compute_field(perturbed_samples_vec, p_samples.clone(),
+                                                               q_samples.clone())
             
             #field = math.sqrt(self._config.DIM)*field/( torch.norm(field, dim=1, keepdim=True) + 1e-5)
             pred  = net(perturbed_samples_vec)
@@ -279,11 +375,11 @@ class EFM:
 
 
             ###############################
-            field = self.GroundTruth(perturbed_samples_vec,
-                                     torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
-                                                  batch_x.view(-1,self._config.DIM-1)], dim=1),
-                                     torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
-                                                  batch_y.view(-1,self._config.DIM-1)], dim=1))
+            field = self._compute_field(perturbed_samples_vec,
+                                        torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
+                                                     batch_x.view(-1,self._config.DIM-1)], dim=1),
+                                        torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
+                                                     batch_y.view(-1,self._config.DIM-1)], dim=1))
 
             if torch.isnan(field).any():
                 print('NaN in Ground Truth field')
@@ -337,13 +433,13 @@ class EFM:
                     perturbed_samples_vec = self.forward_interpolation(batch_x[:self._config.training.small_batch_size],
                                                                        batch_y[:self._config.training.small_batch_size])
             
-                    field = self.GroundTruth(perturbed_samples_vec,
-                                             torch.cat([self._config.p.x_loc*\
-                                                          torch.ones(len(batch_x))[:,None].to(self._config.device),
-                                                          batch_x.view(-1,self._config.DIM-1)], dim=1),
-                                             torch.cat([self._config.q.x_loc*\
-                                                          torch.ones(len(batch_y))[:,None].to(self._config.device),
-                                                          batch_y.view(-1,self._config.DIM-1)], dim=1))
+                    field = self._compute_field(perturbed_samples_vec,
+                                               torch.cat([self._config.p.x_loc*\
+                                                            torch.ones(len(batch_x))[:,None].to(self._config.device),
+                                                            batch_x.view(-1,self._config.DIM-1)], dim=1),
+                                               torch.cat([self._config.q.x_loc*\
+                                                            torch.ones(len(batch_y))[:,None].to(self._config.device),
+                                                            batch_y.view(-1,self._config.DIM-1)], dim=1))
                     
                     #field = field/( torch.norm(field, dim=1, keepdim=True) + 1e-5) 
                     perturbed_samples_x = perturbed_samples_vec[:, 1:].view(-1,self._config.data.num_channels,
@@ -669,6 +765,86 @@ class EFM:
         gt_direction_y *= np.sqrt(self._config.DIM)
         
         
-        return  - gt_direction_x +  gt_direction_y                             
-    ######################################## 
-    
+        return  - gt_direction_x +  gt_direction_y
+    ########################################
+
+
+    ########################################
+    def GroundTruthYukawa(self,
+                          perturbed_samples_vec: torch.Tensor,
+                          p_samples: torch.Tensor,
+                          q_samples: torch.Tensor,
+                          m: float,
+                          **kwargs: tp.Any) -> torch.Tensor:
+        """
+        Yukawa (screened-Poisson) ground-truth field.
+
+        Replaces the Poisson kernel  1/ρ^{N+1}  with the Yukawa kernel
+            w(ρ) = K_{ν}(m·ρ) / ρ^ν,   ν = DIM/2,   DIM = N+1
+        derived from the augmented-space Green's function (eq. 52 in the paper):
+            G(x,t;x') ∝ (m/ρ)^{(N-1)/2} · K_{(N-1)/2}(m·ρ)
+        Taking −∇G and using  d/dx[x^{−ν}K_ν(x)] = −x^{−ν}K_{ν+1}(x)  gives the
+        scalar kernel weight  K_{(N+1)/2}(m·ρ) / ρ^{(N+1)/2} = K_{ν}(m·ρ) / ρ^ν.
+
+        When m → 0 :  K_ν(x) ~ Γ(ν)/2 · (2/x)^ν  →  w ~ 1/ρ^{2ν} = 1/ρ^{DIM}
+        recovering the Poisson kernel exactly.
+
+        Parameters
+        ----------
+        perturbed_samples_vec : [b, D+1]
+        p_samples             : [B, D+1]
+        q_samples             : [B, D+1]
+        m                     : Yukawa screening mass (m > 0)
+        """
+        nu    = self._config.DIM / 2.0
+        gamma = self._config.training.gamma
+
+        rho_x = torch.norm(perturbed_samples_vec.unsqueeze(1) - p_samples, dim=-1)  # [b, B]
+        rho_y = torch.norm(perturbed_samples_vec.unsqueeze(1) - q_samples, dim=-1)  # [b, B]
+
+        rho_x_np = (rho_x + 1e-7).detach().cpu().numpy()
+        rho_y_np = (rho_y + 1e-7).detach().cpu().numpy()
+
+        # Compute log(K_ν(m·ρ) / ρ^ν) stably to avoid overflow when ν = DIM/2 is large.
+        # For m·ρ < ν: K_ν(x) ≈ Γ(ν)/2·(2/x)^ν  →  log K_ν(x) ≈ gammaln(ν)+(ν-1)·log2 − ν·log x
+        # For m·ρ ≥ ν: use kve(ν,x) = K_ν(x)·exp(x)  →  log K_ν(x) = log(kve(ν,x)) − x
+        # Then apply the log-softmax trick (subtract row max) before exp.
+        def _log_yukawa_weight(rho: np.ndarray) -> np.ndarray:
+            z = m * rho                                      # [b, B]
+            log_kv = np.empty_like(rho)
+            small = z < nu
+            if small.any():
+                log_kv[small] = (gammaln(nu) + (nu - 1) * np.log(2)
+                                 - nu * np.log(np.maximum(z[small], 1e-300)))
+            if (~small).any():
+                log_kv[~small] = (np.log(np.maximum(bessel_kve(nu, z[~small]), 1e-300))
+                                  - z[~small])
+            return log_kv - nu * np.log(rho)
+
+        log_w_x = _log_yukawa_weight(rho_x_np)              # [b, B]
+        log_w_y = _log_yukawa_weight(rho_y_np)
+        w_x = np.exp(log_w_x - log_w_x.max(axis=1, keepdims=True))  # log-softmax trick
+        w_y = np.exp(log_w_y - log_w_y.max(axis=1, keepdims=True))
+
+        device = perturbed_samples_vec.device
+        dtype  = perturbed_samples_vec.dtype
+        distance_x = torch.tensor(w_x, device=device, dtype=dtype).unsqueeze(-1)  # [b, B, 1]
+        distance_y = torch.tensor(w_y, device=device, dtype=dtype).unsqueeze(-1)
+
+        coeff_x = distance_x / torch.sum(distance_x, dim=1, keepdim=True)  # [b, B, 1]
+        coeff_y = distance_y / torch.sum(distance_y, dim=1, keepdim=True)
+
+        diff_x = -(perturbed_samples_vec.unsqueeze(1) - p_samples)  # [b, B, D+1]
+        diff_y = -(perturbed_samples_vec.unsqueeze(1) - q_samples)
+
+        gt_direction_x = torch.sum(coeff_x * diff_x, dim=1)  # [b, D+1]
+        gt_direction_y = torch.sum(coeff_y * diff_y, dim=1)
+
+        gt_direction_x /= (gt_direction_x.norm(p=2, dim=-1).view(-1, 1) + gamma)
+        gt_direction_y /= (gt_direction_y.norm(p=2, dim=-1).view(-1, 1) + gamma)
+
+        gt_direction_x *= np.sqrt(self._config.DIM)
+        gt_direction_y *= np.sqrt(self._config.DIM)
+
+        return -gt_direction_x + gt_direction_y
+    ########################################
